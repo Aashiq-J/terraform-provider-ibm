@@ -498,6 +498,18 @@ func lbCreate(context context.Context, d *schema.ResourceData, meta interface{},
 			}
 		}
 		options.Subnets = subnetobjs
+
+		// Wait for all subnets to be available before creating the load balancer
+		for _, subnet := range subnets.List() {
+			subnetID := subnet.(string)
+			log.Printf("[INFO] Checking subnet availability: %s", subnetID)
+			_, err := isWaitForSubnetAvailable(sess, subnetID, d.Timeout(schema.TimeoutCreate))
+			if err != nil {
+				tfErr := flex.TerraformErrorf(err, fmt.Sprintf("isWaitForSubnetAvailable failed for subnet %s: %s", subnetID, err.Error()), "ibm_is_lb", "create")
+				log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
+				return tfErr.GetDiag()
+			}
+		}
 	}
 
 	if securityGroups != nil && securityGroups.Len() != 0 {

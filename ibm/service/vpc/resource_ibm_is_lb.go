@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/IBM-Cloud/terraform-provider-ibm/ibm/flex"
@@ -498,18 +499,6 @@ func lbCreate(context context.Context, d *schema.ResourceData, meta interface{},
 			}
 		}
 		options.Subnets = subnetobjs
-
-		// Wait for all subnets to be available before creating the load balancer
-		for _, subnet := range subnets.List() {
-			subnetID := subnet.(string)
-			log.Printf("[INFO] Checking subnet availability: %s", subnetID)
-			_, err := isWaitForSubnetAvailable(sess, subnetID, d.Timeout(schema.TimeoutCreate))
-			if err != nil {
-				tfErr := flex.TerraformErrorf(err, fmt.Sprintf("isWaitForSubnetAvailable failed for subnet %s: %s", subnetID, err.Error()), "ibm_is_lb", "create")
-				log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
-				return tfErr.GetDiag()
-			}
-		}
 	}
 
 	if securityGroups != nil && securityGroups.Len() != 0 {
@@ -546,9 +535,34 @@ func lbCreate(context context.Context, d *schema.ResourceData, meta interface{},
 		options.Logging = loadBalancerLogging
 	}
 
-	lb, _, err := sess.CreateLoadBalancerWithContext(context, options)
-	if err != nil {
-		tfErr := flex.TerraformErrorf(err, fmt.Sprintf("CreateLoadBalancerWithContext failed: %s", err.Error()), "ibm_is_lb", "create")
+	// Retry CreateLoadBalancer with exponential backoff for subnet-related errors
+	var lb *vpcv1.LoadBalancer
+	retryErr := resource.RetryContext(context, d.Timeout(schema.TimeoutCreate), func() *resource.RetryError {
+		var response *core.DetailedResponse
+		var createErr error
+		lb, response, createErr = sess.CreateLoadBalancerWithContext(context, options)
+		if createErr != nil {
+			// Check if error is related to subnet availability
+			if response != nil && (response.StatusCode == 400 || response.StatusCode == 409) {
+				errMsg := createErr.Error()
+				// Retry on subnet-related errors (subnet not available, subnet pending, etc.)
+				if strings.Contains(errMsg, "subnet") &&
+					(strings.Contains(errMsg, "not available") ||
+						strings.Contains(errMsg, "pending") ||
+						strings.Contains(errMsg, "invalid") ||
+						strings.Contains(errMsg, "provisioning")) {
+					log.Printf("[INFO] Retrying CreateLoadBalancer due to subnet availability issue: %s", errMsg)
+					return resource.RetryableError(createErr)
+				}
+			}
+			// Non-retryable error
+			return resource.NonRetryableError(createErr)
+		}
+		return nil
+	})
+
+	if retryErr != nil {
+		tfErr := flex.TerraformErrorf(retryErr, fmt.Sprintf("CreateLoadBalancerWithContext failed: %s", retryErr.Error()), "ibm_is_lb", "create")
 		log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 		return tfErr.GetDiag()
 	}
@@ -999,9 +1013,33 @@ func lbUpdate(context context.Context, d *schema.ResourceData, meta interface{},
 		}
 		updateLoadBalancerOptions.LoadBalancerPatch = loadBalancerPatch
 
-		_, _, err = sess.UpdateLoadBalancerWithContext(context, updateLoadBalancerOptions)
-		if err != nil {
-			tfErr := flex.TerraformErrorf(err, fmt.Sprintf("UpdateLoadBalancerWithContext failed: %s", err.Error()), "ibm_is_lb", "update")
+		// Retry UpdateLoadBalancer with exponential backoff for subnet-related errors
+		retryErr := resource.RetryContext(context, d.Timeout(schema.TimeoutUpdate), func() *resource.RetryError {
+			var response *core.DetailedResponse
+			var updateErr error
+			_, response, updateErr = sess.UpdateLoadBalancerWithContext(context, updateLoadBalancerOptions)
+			if updateErr != nil {
+				// Check if error is related to subnet availability
+				if response != nil && (response.StatusCode == 400 || response.StatusCode == 409) {
+					errMsg := updateErr.Error()
+					// Retry on subnet-related errors (subnet not available, subnet pending, etc.)
+					if strings.Contains(errMsg, "subnet") &&
+						(strings.Contains(errMsg, "not available") ||
+							strings.Contains(errMsg, "pending") ||
+							strings.Contains(errMsg, "invalid") ||
+							strings.Contains(errMsg, "provisioning")) {
+						log.Printf("[INFO] Retrying UpdateLoadBalancer due to subnet availability issue: %s", errMsg)
+						return resource.RetryableError(updateErr)
+					}
+				}
+				// Non-retryable error
+				return resource.NonRetryableError(updateErr)
+			}
+			return nil
+		})
+
+		if retryErr != nil {
+			tfErr := flex.TerraformErrorf(retryErr, fmt.Sprintf("UpdateLoadBalancerWithContext failed: %s", retryErr.Error()), "ibm_is_lb", "update")
 			log.Printf("[DEBUG]\n%s", tfErr.GetDebugMessage())
 			return tfErr.GetDiag()
 		}
